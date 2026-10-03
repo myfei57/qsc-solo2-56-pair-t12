@@ -13,6 +13,7 @@ from __future__ import annotations
 from .audit import AuditLog, build_timeline
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config, with_storage_root
+from .dispatch import DispatchService
 from .door import (
     DoorController,
     active_group,
@@ -138,9 +139,62 @@ class Platform:
         self._operations = 0
         self._event_counts: dict[str, int] = {}
         self.bus.subscribe("*", self._on_event)
+        self.dispatch = self._build_dispatch()
         self._register_namespaces()
         self._seed(store)
         self._restore()
+
+    def _build_dispatch(self) -> DispatchService | None:
+        """装配对外投递链；配置关闭时不挂事件入口。"""
+
+        if not self.config.dispatch.enabled:
+            return None
+
+        def audit(kind: str, sub_id: str, station_id: str, detail: dict) -> None:
+            self.audit.record(kind, "", station_id, sub_id=sub_id, **self._flat(detail))
+
+        service = DispatchService(
+            self.store,
+            self.bus,
+            self.clock,
+            audit=audit,
+            max_attempts=self.config.dispatch.max_attempts,
+            base_backoff_s=self.config.dispatch.base_backoff_s,
+            max_backoff_s=self.config.dispatch.max_backoff_s,
+            request_timeout_s=self.config.dispatch.request_timeout_s,
+            concurrency=self.config.dispatch.concurrency,
+            global_rate_per_min=self.config.dispatch.global_rate_per_min,
+            journal_segment=self.config.dispatch.journal_segment,
+            ingest_topics=tuple(self.config.dispatch.ingest_topics),
+        )
+        service.attach()
+        return service
+
+    @staticmethod
+    def _flat(detail: dict) -> dict:
+        """审计 detail 只收标量，结构型字段转成 JSON 字符串落盘。"""
+
+        import json
+
+        flat: dict = {}
+        for key, value in detail.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                flat[key] = value
+            else:
+                flat[key] = json.dumps(value, ensure_ascii=False, default=str)
+        return flat
+
+    def start_delivery(self) -> None:
+        """启动对外投递工作线程（控制台服务启动时调用）。"""
+
+        if self.dispatch is not None:
+            self.dispatch.start()
+
+    def stop_delivery(self) -> None:
+        """停止对外投递工作线程。"""
+
+        if self.dispatch is not None:
+            self.dispatch.stop()
 
     def _on_event(self, event: Event) -> None:
         """统计总线事件，供状态接口判断动作有没有真的流过组件。"""
@@ -748,6 +802,7 @@ class Platform:
             },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "dispatch": self.dispatch.status() if self.dispatch is not None else {"enabled": False},
             "trend": self.trend.snapshot(limit=4),
             "ids_issued": self.ids.issued(),
         }

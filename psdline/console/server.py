@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 from ..app import Platform
 from ..eventbus import Event
 from .api import Api
+from .dispatch_api import PREFIX, DispatchAdmin
 from .pages import render_page
 
 
@@ -45,6 +46,18 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             body = {}
         query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+        headers = {key: value for key, value in self.headers.items()}
+
+        if parsed.path.startswith(PREFIX + "/") or parsed.path == PREFIX:
+            status, payload = self.server.dispatch_admin.handle(  # type: ignore[attr-defined]
+                method, parsed.path, query, body, headers
+            )
+            self._respond(
+                status,
+                json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"),
+                "application/json; charset=utf-8",
+            )
+            return
 
         if method == "GET":
             page = render_page(parsed.path, self.server.platform)  # type: ignore[attr-defined]
@@ -75,6 +88,7 @@ class _ConsoleHTTPServer(ThreadingHTTPServer):
         super().__init__(address, _Handler)
         self.api = api
         self.platform = platform
+        self.dispatch_admin = DispatchAdmin(platform)
 
     def record_access(self, path: str) -> None:
         self.platform.bus.publish(
@@ -92,10 +106,18 @@ class ConsoleServer:
         self._server: _ConsoleHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._api = Api(platform)
+        self._dispatch_admin: DispatchAdmin | None = None
 
     @property
     def api(self) -> Api:
         return self._api
+
+    def dispatch_routes(self) -> list[dict]:
+        """返回对外投递管理接口清单。"""
+
+        if self._dispatch_admin is not None:
+            return self._dispatch_admin.routes()
+        return DispatchAdmin(self._platform).routes()
 
     @property
     def port(self) -> int:
@@ -108,7 +130,9 @@ class ConsoleServer:
 
         if self._server is not None:
             return self.base_url()
+        self._platform.start_delivery()
         self._server = _ConsoleHTTPServer((self._host, self._port), self._api, self._platform)
+        self._dispatch_admin = self._server.dispatch_admin
         self._thread = threading.Thread(
             target=self._server.serve_forever, name="psdline-console", daemon=True
         )
@@ -128,10 +152,12 @@ class ConsoleServer:
             return
         self._server.shutdown()
         self._server.server_close()
+        self._platform.stop_delivery()
         if self._thread is not None:
             self._thread.join(timeout=5)
         self._server = None
         self._thread = None
+        self._dispatch_admin = None
 
 
 def probe_endpoints(base_url: str, paths: list[str]) -> dict:

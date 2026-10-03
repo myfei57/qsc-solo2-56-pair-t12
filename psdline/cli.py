@@ -43,7 +43,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     platform = _build(args)
     server = ConsoleServer(platform, host=args.host, port=args.port)
     base_url = server.start()
-    payload: dict = {"listening": base_url, "routes": server.api.routes()}
+    payload: dict = {"listening": base_url, "routes": server.api.routes(), "dispatch_routes": server.dispatch_routes()}
     if args.probe:
         payload["probe"] = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS))
     _dump(payload)
@@ -182,6 +182,67 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dispatch(args: argparse.Namespace) -> int:
+    """对外投递的离线管理：引导令牌、登记订户、查看死信、人工重投。"""
+
+    platform = _build(args)
+    service = platform.dispatch
+    if service is None:
+        _dump({"error": "对外投递未启用（配置 dispatch.enabled=false）"})
+        return 2
+    action = args.dispatch_action
+
+    if action == "issue-token":
+        _dump(service.issue_token(args.label, args.scope, by="cli"))
+        return 0
+    if action == "revoke-token":
+        _dump(service.revoke_token(args.token_id, by="cli"))
+        return 0
+    if action == "list-tokens":
+        _dump({"tokens": [token.public_view() for token in service.tokens.list()]})
+        return 0
+    if action == "subscribe":
+        start_seq = service.outbox.head_seq if args.start_seq < 0 else args.start_seq
+        _dump(
+            service.register_subscriber(
+                by="cli",
+                name=args.name,
+                callback=args.callback,
+                topics=tuple(args.topics.split(",")) if args.topics else ("door",),
+                stations=tuple(args.stations.split(",")) if args.stations else (),
+                rate_per_min=args.rate,
+                start_seq=start_seq,
+            )
+        )
+        return 0
+    if action == "list":
+        _dump({"subscribers": [sub.public_view() for sub in service.subscriptions.list()]})
+        return 0
+    if action == "pause":
+        _dump(service.pause_subscriber(args.sub_id, by="cli"))
+        return 0
+    if action == "resume":
+        _dump(service.resume_subscriber(args.sub_id, by="cli", from_seq=args.start_seq))
+        return 0
+    if action == "revoke":
+        _dump(service.revoke_subscriber(args.sub_id, by="cli"))
+        return 0
+    if action == "dead":
+        _dump(service.list_dead(args.sub_id or ""))
+        return 0
+    if action == "replay":
+        _dump(service.replay_dead(args.sub_id, by="cli"))
+        return 0
+    if action == "discard":
+        _dump(service.discard_dead(args.sub_id, by="cli"))
+        return 0
+    if action == "status":
+        _dump(service.status())
+        return 0
+    print(f"未知投递子命令: {action}", file=sys.stderr)
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -216,6 +277,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    dispatch = sub.add_parser("dispatch", help="对外事件投递管理", parents=[common])
+    dispatch_sub = dispatch.add_subparsers(dest="dispatch_action", required=True)
+
+    issue = dispatch_sub.add_parser("issue-token", help="签发管理令牌（明文只显示一次）", parents=[common])
+    issue.add_argument("--label", required=True)
+    issue.add_argument("--scope", choices=("admin", "ops", "auditor"), default="ops")
+
+    revoke_tok = dispatch_sub.add_parser("revoke-token", help="吊销管理令牌", parents=[common])
+    revoke_tok.add_argument("token_id")
+    dispatch_sub.add_parser("list-tokens", help="列出管理令牌", parents=[common])
+
+    subscribe = dispatch_sub.add_parser("subscribe", help="登记订户", parents=[common])
+    subscribe.add_argument("--name", required=True)
+    subscribe.add_argument("--callback", required=True)
+    subscribe.add_argument("--topics", default="door", help="逗号分隔，* 表示全量")
+    subscribe.add_argument("--stations", default="", help="逗号分隔的站台过滤")
+    subscribe.add_argument("--rate", type=float, default=0.0, help="每分钟投递上限，0 不限")
+    subscribe.add_argument("--start-seq", type=int, default=-1, help="从哪个序号开始，-1 表示只收新事件")
+    dispatch_sub.add_parser("list", help="列出订户", parents=[common])
+
+    pause = dispatch_sub.add_parser("pause", help="暂停订户", parents=[common])
+    pause.add_argument("sub_id")
+    resume = dispatch_sub.add_parser("resume", help="恢复订户", parents=[common])
+    resume.add_argument("sub_id")
+    resume.add_argument("--start-seq", type=int, default=None)
+    revoke_sub = dispatch_sub.add_parser("revoke", help="吊销订户", parents=[common])
+    revoke_sub.add_argument("sub_id")
+
+    dead = dispatch_sub.add_parser("dead", help="查看死信", parents=[common])
+    dead.add_argument("sub_id", nargs="?", default="")
+    replay = dispatch_sub.add_parser("replay", help="人工重投死信", parents=[common])
+    replay.add_argument("sub_id")
+    discard = dispatch_sub.add_parser("discard", help="放弃死信（admin）", parents=[common])
+    discard.add_argument("sub_id")
+    dispatch_sub.add_parser("status", help="投递链路状态", parents=[common])
+    dispatch.set_defaults(func=_cmd_dispatch)
     return parser
 
 

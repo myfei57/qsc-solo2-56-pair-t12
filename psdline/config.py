@@ -103,6 +103,27 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class DispatchSection:
+    """对外事件投递。
+
+    ``enabled`` 为真时随控制台服务一起启动投递线程；``max_attempts`` 是单条
+    事件的投递上限（含首次），超过后进死信；``base/max_backoff_s`` 控制指数
+    退避；``concurrency`` 是订户之间的并发上限；``global_rate_per_min`` 为 0
+    表示不限总速率。订户可各自再设速率。
+    """
+
+    enabled: bool = True
+    max_attempts: int = 8
+    base_backoff_s: float = 1.0
+    max_backoff_s: float = 300.0
+    request_timeout_s: float = 10.0
+    concurrency: int = 8
+    global_rate_per_min: float = 0.0
+    journal_segment: int = 1024
+    ingest_topics: tuple[str, ...] = ("door", "audit")
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +145,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    dispatch: DispatchSection = field(default_factory=DispatchSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,6 +191,18 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.dispatch.max_attempts <= 0:
+            raise ConfigError("投递重试上限必须为正", component="config")
+        if self.dispatch.base_backoff_s <= 0 or self.dispatch.max_backoff_s < self.dispatch.base_backoff_s:
+            raise ConfigError("退避基数必须为正且封顶不小于基数", component="config")
+        if self.dispatch.request_timeout_s <= 0:
+            raise ConfigError("投递超时必须为正", component="config")
+        if self.dispatch.concurrency <= 0:
+            raise ConfigError("投递并发度必须为正", component="config")
+        if self.dispatch.journal_segment <= 0:
+            raise ConfigError("投递流水分段长度必须为正", component="config")
+        if not self.dispatch.ingest_topics:
+            raise ConfigError("至少要投递一个事件主题", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -189,6 +223,9 @@ def _section(cls, payload: object):
     kwargs = {key: value for key, value in payload.items() if key in known}
     if cls is NamespaceSection and "stations" in kwargs:
         kwargs["stations"] = tuple(str(item) for item in kwargs["stations"])
+    if cls is DispatchSection and "ingest_topics" in kwargs:
+        raw_topics = kwargs["ingest_topics"]
+        kwargs["ingest_topics"] = tuple(str(item) for item in raw_topics) if isinstance(raw_topics, (list, tuple)) else ("door", "audit")
     return cls(**kwargs)
 
 
@@ -213,6 +250,17 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "dispatch": {
+            "enabled": config.dispatch.enabled,
+            "max_attempts": config.dispatch.max_attempts,
+            "base_backoff_s": config.dispatch.base_backoff_s,
+            "max_backoff_s": config.dispatch.max_backoff_s,
+            "request_timeout_s": config.dispatch.request_timeout_s,
+            "concurrency": config.dispatch.concurrency,
+            "global_rate_per_min": config.dispatch.global_rate_per_min,
+            "journal_segment": config.dispatch.journal_segment,
+            "ingest_topics": list(config.dispatch.ingest_topics),
+        },
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +281,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        dispatch=_section(DispatchSection, payload.get("dispatch")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()

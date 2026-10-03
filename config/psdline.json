@@ -47,6 +47,17 @@
   "audit": {
     "journal_segment": 512
   },
+  "dispatch": {
+    "enabled": true,
+    "max_attempts": 8,
+    "base_backoff_s": 1.0,
+    "max_backoff_s": 300.0,
+    "request_timeout_s": 10.0,
+    "concurrency": 8,
+    "global_rate_per_min": 0,
+    "journal_segment": 1024,
+    "ingest_topics": ["door", "audit"]
+  },
   "console": {
     "host": "127.0.0.1",
     "port": 8080
