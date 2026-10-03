@@ -24,6 +24,14 @@ from .clock import ManualClock, SystemClock
 from .config import config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
 from .errors import RailError
+from .webhook.server import WebhookServer
+from .webhook.service import (
+    SCOPE_ADMIN,
+    SCOPE_INGEST,
+    SCOPE_SUBSCRIBER,
+    Principal,
+    WebhookService,
+)
 
 DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/stations", "/", "/alarms")
 
@@ -44,21 +52,35 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     server = ConsoleServer(platform, host=args.host, port=args.port)
     base_url = server.start()
     payload: dict = {"listening": base_url, "routes": server.api.routes()}
+    webhook_server = None
+    if getattr(args, "webhook", False) or platform.config.webhook.enabled:
+        service = platform.enable_webhooks(autostart=True)
+        section = platform.config.webhook
+        webhook_server = WebhookServer(service, host=args.webhook_host or section.host,
+                                       port=args.webhook_port or section.port)
+        payload["webhook"] = webhook_server.start()
     if args.probe:
         payload["probe"] = probe_endpoints(base_url, list(DEFAULT_PROBE_PATHS))
     _dump(payload)
+
+    def finish() -> None:
+        if webhook_server is not None:
+            webhook_server.stop()
+        platform.shutdown()
+        server.stop()
+
     if args.duration > 0:
         try:
             time.sleep(args.duration)
         except KeyboardInterrupt:  # pragma: no cover - 交互路径
             pass
-        server.stop()
+        finish()
         return 0
     try:
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:  # pragma: no cover - 交互路径
-        server.stop()
+        finish()
     return 0
 
 
@@ -182,6 +204,185 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- 对外投递子系统命令 ---------------------------------------------------
+
+
+def _webhook_service(args: argparse.Namespace) -> tuple[Platform, WebhookService]:
+    platform = _build(args)
+    service = platform.enable_webhooks(autostart=False)
+    return platform, service
+
+
+def _admin(platform: Platform) -> Principal:
+    """CLI 本地操作以 root 管理员身份执行（操作者即本机持库者）。"""
+
+    return Principal(key_id=f"cli-{platform.unit}", scope=SCOPE_ADMIN, name="本地命令行")
+
+
+def _split_topics(value: str | None) -> list[str]:
+    return [item.strip() for item in (value or "*").split(",") if item.strip()]
+
+
+def _wh_bootstrap(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        result = service.create_credential(_admin(platform), args.name, SCOPE_ADMIN)
+        _dump(result)
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_issue_key(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        result = service.create_credential(
+            _admin(platform), args.name, args.scope,
+            allowed_topics=_split_topics(args.topics), sub_id=args.sub_id or "",
+        )
+        _dump(result)
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_keys(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        _dump(service.list_credentials(_admin(platform)))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_revoke_key(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        _dump(service.revoke_credential(_admin(platform), args.key_id))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_add_sub(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        body = {
+            "name": args.name,
+            "target_url": args.url,
+            "topics": _split_topics(args.topics),
+            "max_rate": args.max_rate,
+            "max_attempts": args.max_attempts,
+        }
+        _dump(service.create_subscription(_admin(platform), body))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_subs(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        _dump(service.list_subscriptions(_admin(platform)))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_sub_action(args: argparse.Namespace, attr: str) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        method = getattr(service, attr)
+        _dump(method(_admin(platform), args.sub_id))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_test(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        _dump(service.test_delivery(_admin(platform), args.sub_id))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_emit(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        payload = json.loads(args.payload) if args.payload else {}
+        if not isinstance(payload, dict):
+            raise RailError("事件负载必须是 JSON 对象", component="webhook")
+        _dump(service.ingest(
+            args.topic, args.action, payload, event_id=args.event_id or "",
+            source="cli", actor=_admin(platform).key_id,
+        ))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_events(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        _dump(service.list_events(_admin(platform), args.after_seq, args.limit))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_deliveries(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        _dump(service.list_deliveries(_admin(platform), args.sub_id or None,
+                                      args.status or None, args.limit,
+                                      args.after_seq))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_delivery(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        _dump(service.get_delivery(_admin(platform), args.delivery_id))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_replay(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        if args.delivery_id:
+            _dump(service.replay_delivery(_admin(platform), args.delivery_id))
+        else:
+            _dump(service.replay_dead(_admin(platform), args.sub_id or ""))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_audit(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        _dump(service.list_audit(_admin(platform), args.after_id, args.limit))
+    finally:
+        service.stop()
+    return 0
+
+
+def _wh_verify(args: argparse.Namespace) -> int:
+    platform, service = _webhook_service(args)
+    try:
+        result = service.verify_audit(_admin(platform))
+        _dump(result)
+        return 0 if result["ok"] else 1
+    finally:
+        service.stop()
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -198,6 +399,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--duration", type=float, default=0.0, help="运行多少秒后退出，0 表示常驻")
     serve.add_argument("--probe", action="store_true", help="启动后探测接口")
+    serve.add_argument("--webhook", action="store_true", help="同时启动对外事件投递服务")
+    serve.add_argument("--webhook-host", default=None, help="投递服务监听地址")
+    serve.add_argument("--webhook-port", type=int, default=None, help="投递服务监听端口")
     serve.set_defaults(func=_cmd_serve)
 
     demo = sub.add_parser("demo", help="跑一遍完整流程", parents=[common])
@@ -216,7 +420,100 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    _build_webhook_parsers(sub, common)
     return parser
+
+
+def _build_webhook_parsers(sub, common) -> None:
+    """注册对外投递子系统的管理命令。"""
+
+    webhook = sub.add_parser("webhook", help="对外事件投递管理", parents=[common])
+    wh = webhook.add_subparsers(dest="webhook_command", required=True)
+
+    bootstrap = wh.add_parser("bootstrap", help="签发首个管理员凭据", parents=[common])
+    bootstrap.add_argument("--name", default="root-admin")
+    bootstrap.set_defaults(func=_wh_bootstrap)
+
+    issue = wh.add_parser("issue-key", help="签发 ingest/subscriber/admin 凭据",
+                          parents=[common])
+    issue.add_argument("--name", required=True)
+    issue.add_argument("--scope", choices=(SCOPE_ADMIN, SCOPE_INGEST, SCOPE_SUBSCRIBER),
+                       required=True)
+    issue.add_argument("--topics", default="*", help="允许的事件主题，逗号分隔")
+    issue.add_argument("--sub-id", default="", help="subscriber 凭据绑定的订户")
+    issue.set_defaults(func=_wh_issue_key)
+
+    keys = wh.add_parser("keys", help="列出凭据", parents=[common])
+    keys.set_defaults(func=_wh_keys)
+
+    revoke = wh.add_parser("revoke-key", help="吊销凭据", parents=[common])
+    revoke.add_argument("--key-id", required=True)
+    revoke.set_defaults(func=_wh_revoke_key)
+
+    add_sub = wh.add_parser("add-sub", help="登记订户", parents=[common])
+    add_sub.add_argument("--name", required=True)
+    add_sub.add_argument("--url", required=True, help="投递目标 URL")
+    add_sub.add_argument("--topics", default="door", help="订阅主题，逗号分隔")
+    add_sub.add_argument("--max-rate", type=float, default=0.0, help="每秒投递上限，0 不限")
+    add_sub.add_argument("--max-attempts", type=int, default=8)
+    add_sub.set_defaults(func=_wh_add_sub)
+
+    subs = wh.add_parser("subs", help="列出订户", parents=[common])
+    subs.set_defaults(func=_wh_subs)
+
+    pause = wh.add_parser("pause-sub", help="暂停订户投递", parents=[common])
+    pause.add_argument("--sub-id", required=True)
+    pause.set_defaults(func=lambda a: _wh_sub_action(a, "pause_subscription"))
+
+    resume = wh.add_parser("resume-sub", help="恢复订户投递", parents=[common])
+    resume.add_argument("--sub-id", required=True)
+    resume.set_defaults(func=lambda a: _wh_sub_action(a, "resume_subscription"))
+
+    cancel = wh.add_parser("cancel-sub", help="注销订户", parents=[common])
+    cancel.add_argument("--sub-id", required=True)
+    cancel.set_defaults(func=lambda a: _wh_sub_action(a, "revoke_subscription"))
+
+    test = wh.add_parser("test-sub", help="向订户地址发探测事件", parents=[common])
+    test.add_argument("--sub-id", required=True)
+    test.set_defaults(func=_wh_test)
+
+    emit = wh.add_parser("emit", help="手工推一条事件进总账", parents=[common])
+    emit.add_argument("--topic", default="door")
+    emit.add_argument("--action", default="manual")
+    emit.add_argument("--payload", default="{}", help="JSON 对象字符串")
+    emit.add_argument("--event-id", default="")
+    emit.set_defaults(func=_wh_emit)
+
+    events = wh.add_parser("events", help="查事件总账", parents=[common])
+    events.add_argument("--after-seq", type=int, default=0)
+    events.add_argument("--limit", type=int, default=100)
+    events.set_defaults(func=_wh_events)
+
+    deliveries = wh.add_parser("deliveries", help="查投递记录", parents=[common])
+    deliveries.add_argument("--sub-id", default="")
+    deliveries.add_argument("--status", default="", choices=("", "pending", "leased",
+                                                             "succeeded", "dead"))
+    deliveries.add_argument("--after-seq", type=int, default=0)
+    deliveries.add_argument("--limit", type=int, default=100)
+    deliveries.set_defaults(func=_wh_deliveries)
+
+    delivery = wh.add_parser("delivery", help="查单条投递（含每次尝试）", parents=[common])
+    delivery.add_argument("--delivery-id", required=True)
+    delivery.set_defaults(func=_wh_delivery)
+
+    replay = wh.add_parser("replay", help="人工重投死信", parents=[common])
+    replay.add_argument("--delivery-id", default="", help="指定单条；不给则批量")
+    replay.add_argument("--sub-id", default="", help="批量重投时限定订户")
+    replay.set_defaults(func=_wh_replay)
+
+    audit = wh.add_parser("audit", help="查投递审计链", parents=[common])
+    audit.add_argument("--after-id", type=int, default=0)
+    audit.add_argument("--limit", type=int, default=100)
+    audit.set_defaults(func=_wh_audit)
+
+    verify = wh.add_parser("verify", help="校验审计哈希链", parents=[common])
+    verify.set_defaults(func=_wh_verify)
 
 
 def main(argv: list[str] | None = None) -> int:

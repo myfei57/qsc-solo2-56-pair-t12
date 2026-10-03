@@ -137,15 +137,35 @@ class Platform:
         self._cycles = 0
         self._operations = 0
         self._event_counts: dict[str, int] = {}
+        self.webhook_service = None
         self.bus.subscribe("*", self._on_event)
         self._register_namespaces()
         self._seed(store)
         self._restore()
+        if self.config.webhook.enabled:
+            self.enable_webhooks(autostart=True)
 
     def _on_event(self, event: Event) -> None:
         """统计总线事件，供状态接口判断动作有没有真的流过组件。"""
 
         self._event_counts[event.topic] = self._event_counts.get(event.topic, 0) + 1
+
+    def enable_webhooks(self, autostart: bool = False):
+        """装配对外事件投递子系统并桥接门控事件主题（幂等，只装一次）。"""
+
+        if self.webhook_service is not None:
+            return self.webhook_service
+        from .webhook import WebhookService
+
+        db_path = f"{self.store.root}/webhook/deliveries.db"
+        service = WebhookService(
+            db_path, clock=self.clock, config=self.config.webhook, unit=self.unit
+        )
+        service.attach_bus(self.bus, self.config.webhook.bridge_topics)
+        if autostart:
+            service.start()
+        self.webhook_service = service
+        return service
 
     # ---- 装配 ---------------------------------------------------------
 
@@ -840,6 +860,13 @@ class Platform:
         if not self.store.exists("platform/state"):
             return False
         return self.store.remove("platform/state")
+
+    def shutdown(self) -> None:
+        """收口对外投递子系统（停止调度与在途传输）。"""
+
+        if self.webhook_service is not None:
+            self.webhook_service.stop()
+            self.webhook_service = None
 
     # ---- 内部 ---------------------------------------------------------
 

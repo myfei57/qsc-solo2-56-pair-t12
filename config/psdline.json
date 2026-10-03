@@ -50,5 +50,22 @@
   "console": {
     "host": "127.0.0.1",
     "port": 8080
+  },
+  "webhook": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 8090,
+    "bridge_topics": ["door"],
+    "enqueue_interval_s": 0.2,
+    "schedule_interval_s": 0.1,
+    "lease_s": 30.0,
+    "workers": 16,
+    "max_concurrency_per_sub": 4,
+    "timeout_s": 10.0,
+    "backoff_base_s": 1.0,
+    "backoff_factor": 2.0,
+    "backoff_max_s": 300.0,
+    "default_max_rate": 0.0,
+    "default_max_attempts": 8
   }
 }

@@ -111,6 +111,56 @@ class ConsoleSection:
 
 
 @dataclass(frozen=True)
+class WebhookSection:
+    """对外事件投递（门控事件 webhook）配置。
+
+    投递语义为「逐条、至少一次」：同一订户同一聚合键（默认取站台，其次列车）
+    严格按事件序号投递，不同聚合键之间并发，兼顾顺序与吞吐。订户必须以
+    ``Event-ID`` 作幂等键去重，重试与崩溃恢复才不会产生第二份效果。
+    """
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8090
+    bridge_topics: tuple[str, ...] = ("door",)
+    enqueue_interval_s: float = 0.2
+    schedule_interval_s: float = 0.1
+    lease_s: float = 30.0
+    workers: int = 16
+    max_concurrency_per_sub: int = 4
+    timeout_s: float = 10.0
+    backoff_base_s: float = 1.0
+    backoff_factor: float = 2.0
+    backoff_max_s: float = 300.0
+    default_max_rate: float = 0.0
+    default_max_attempts: int = 8
+
+    def validate_section(self) -> None:
+        """校验投递小节取值。"""
+
+        if not 0 < self.port <= 65535:
+            raise ConfigError("投递服务端口必须落在 1..65535", component="config")
+        if not self.bridge_topics:
+            raise ConfigError("至少桥接一个事件主题", component="config")
+        if self.enqueue_interval_s <= 0 or self.schedule_interval_s <= 0:
+            raise ConfigError("调度间隔必须为正", component="config")
+        if self.lease_s <= 0:
+            raise ConfigError("租约时长必须为正", component="config")
+        if not 1 <= self.workers <= 256:
+            raise ConfigError("投递并发数必须落在 1..256", component="config")
+        if not 1 <= self.max_concurrency_per_sub <= 64:
+            raise ConfigError("单订户并发数必须落在 1..64", component="config")
+        if self.timeout_s <= 0:
+            raise ConfigError("投递超时必须为正", component="config")
+        if self.backoff_base_s <= 0 or self.backoff_factor < 1 or self.backoff_max_s < self.backoff_base_s:
+            raise ConfigError("退避参数非法", component="config")
+        if self.default_max_rate < 0:
+            raise ConfigError("默认限流不能为负", component="config")
+        if not 1 <= self.default_max_attempts <= 50:
+            raise ConfigError("默认重试上限必须落在 1..50", component="config")
+
+
+@dataclass(frozen=True)
 class PlatformConfig:
     """一份完整的控制服务配置。"""
 
@@ -125,6 +175,7 @@ class PlatformConfig:
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
+    webhook: WebhookSection = field(default_factory=WebhookSection)
 
     @property
     def name(self) -> str:
@@ -171,6 +222,7 @@ class PlatformConfig:
             raise ConfigError("审计分段长度必须为正", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
+        self.webhook.validate_section()
         return self
 
 
@@ -189,6 +241,8 @@ def _section(cls, payload: object):
     kwargs = {key: value for key, value in payload.items() if key in known}
     if cls is NamespaceSection and "stations" in kwargs:
         kwargs["stations"] = tuple(str(item) for item in kwargs["stations"])
+    if cls is WebhookSection and "bridge_topics" in kwargs:
+        kwargs["bridge_topics"] = tuple(str(item) for item in kwargs["bridge_topics"])
     return cls(**kwargs)
 
 
@@ -214,6 +268,10 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
         "console": dict(config.console.__dict__),
+        "webhook": {
+            **dict(config.webhook.__dict__),
+            "bridge_topics": list(config.webhook.bridge_topics),
+        },
     }
 
 
@@ -234,6 +292,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
         console=_section(ConsoleSection, payload.get("console")),
+        webhook=_section(WebhookSection, payload.get("webhook")),
     )
     return config.validate()
 
